@@ -84,6 +84,8 @@ var (
 	ErrOversizedData = errors.New("oversized data")
 
 	ErrBlackListPrice = errors.New("price too low")
+
+	ErrInvalidPoolTypeInfo = errors.New("invalid pool type info")
 )
 
 var (
@@ -255,7 +257,8 @@ type TxPool struct {
 	all     *txLookup                    // All transactions to allow lookups
 	priced  *txPricedList                // All transactions sorted by price
 
-	blackList *blackList //validate tx by black list
+	blackList    *blackList    //validate tx by black list
+	poolTypeInfo *PoolTypeInfo //pool seperate into serval parts to load different kinds of txs
 
 	chainHeadCh     chan ChainHeadEvent
 	chainHeadSub    event.Subscription
@@ -295,7 +298,13 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		reorgShutdownCh: make(chan struct{}),
 		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
 		blackList:       newBlackList(),
+		poolTypeInfo:    newPoolTypeInfo(),
 	}
+
+	//for test use
+	pool.poolTypeInfo.Items[0] = 70
+	pool.poolTypeInfo.Items[1] = 30
+
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
 		log.Info("Setting new local account", "address", addr)
@@ -328,6 +337,10 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	go pool.loopBlacklist()
 
 	return pool
+}
+
+func (pool *TxPool) GetPoolTypeInfo() *PoolTypeInfo {
+	return pool.poolTypeInfo
 }
 
 func (pool *TxPool) loopBlacklist() {
@@ -674,22 +687,31 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		invalidTxMeter.Mark(1)
 		return false, err
 	}
-	// If the transaction pool is full, discard underpriced transactions
-	if uint64(pool.all.Count()) >= pool.config.GlobalSlots+pool.config.GlobalQueue {
-		// If the new transaction is underpriced, don't accept it
-		if !local && pool.priced.Underpriced(tx, pool.locals) {
-			log.Trace("Discarding underpriced transaction", "hash", hash, "price", tx.GasPrice())
-			underpricedTxMeter.Mark(1)
-			return false, ErrUnderpriced
-		}
-		// New transaction is better than our worse ones, make room for it
-		drop := pool.priced.Discard(pool.all.Slots()-int(pool.config.GlobalSlots+pool.config.GlobalQueue)+numSlots(tx), pool.locals)
-		for _, tx := range drop {
-			log.Trace("Discarding freshly underpriced transaction", "hash", tx.Hash(), "price", tx.GasPrice())
-			underpricedTxMeter.Mark(1)
-			pool.removeTx(tx.Hash(), false)
+
+	pool.poolTypeInfo.Lock.RLock()
+	percent, ok := pool.poolTypeInfo.Items[tx.PoolType]
+	pool.poolTypeInfo.Lock.RUnlock()
+	if ok {
+		slotForPoolType := int(pool.config.GlobalSlots+pool.config.GlobalQueue) * int(percent) / 100
+		log.Info("slot for pool type", "type", tx.PoolType, "slot", slotForPoolType, "current", pool.all.SlotsByType(tx.PoolType))
+
+		if pool.all.SlotsByType(tx.PoolType) >= slotForPoolType {
+			// If the new transaction is underpriced, don't accept it
+			if !local && pool.priced.Underpriced(tx, pool.locals) {
+				log.Info("Discarding underpriced transaction", "hash", hash, "price", tx.GasPrice())
+				underpricedTxMeter.Mark(1)
+				return false, ErrUnderpriced
+			}
+			// New transaction is better than our worse ones, make room for it
+			drop := pool.priced.Discard(tx.PoolType, pool.all.SlotsByType(tx.PoolType)-slotForPoolType+numSlots(tx), pool.locals)
+			for _, tx := range drop {
+				log.Info("Discarding freshly underpriced transaction", "hash", tx.Hash(), "price", tx.GasPrice())
+				underpricedTxMeter.Mark(1)
+				pool.removeTx(tx.Hash(), false)
+			}
 		}
 	}
+
 	// Try to replace an existing transaction in the pending pool
 	from, _ := types.Sender(pool.signer, tx) // already validated
 	if list := pool.pending[from]; list != nil && list.Overlaps(tx) {
@@ -876,7 +898,15 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 		errs = make([]error, len(txs))
 		news = make([]*types.Transaction, 0, len(txs))
 	)
+
 	for i, tx := range txs {
+		//for test use
+		if tx.To().Hash().Big().Cmp(big.NewInt(0)) == 0 {
+			tx.PoolType = 1
+		} else {
+			tx.PoolType = 0
+		}
+
 		// If the transaction is known, pre-set the error slot
 		if pool.all.Get(tx.Hash()) != nil {
 			errs[i] = ErrAlreadyKnown
@@ -1387,7 +1417,7 @@ func (pool *TxPool) truncatePending() {
 
 						// Update the account nonce to the dropped transaction
 						pool.pendingNonces.setIfLower(offenders[i], tx.Nonce())
-						log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
+						log.Info("Removed fairness-exceeding pending transaction", "hash", hash)
 					}
 					pool.priced.Removed(len(caps))
 					pendingGauge.Dec(int64(len(caps)))
@@ -1466,6 +1496,7 @@ func (pool *TxPool) truncateQueue() {
 		// Otherwise drop only last few transactions
 		txs := list.Flatten()
 		for i := len(txs) - 1; i >= 0 && drop > 0; i-- {
+			log.Info("Removed fairness-exceeding queue transaction", "hash", txs[i].Hash())
 			pool.removeTx(txs[i].Hash(), true)
 			drop--
 			queuedRateLimitMeter.Mark(1)
@@ -1622,15 +1653,17 @@ func (as *accountSet) merge(other *accountSet) {
 // peeking into the pool in TxPool.Get without having to acquire the widely scoped
 // TxPool.mu mutex.
 type txLookup struct {
-	all   map[common.Hash]*types.Transaction
-	slots int
-	lock  sync.RWMutex
+	all        map[common.Hash]*types.Transaction
+	slots      int
+	slotByType map[types.TxPoolType]int
+	lock       sync.RWMutex
 }
 
 // newTxLookup returns a new txLookup structure.
 func newTxLookup() *txLookup {
 	return &txLookup{
-		all: make(map[common.Hash]*types.Transaction),
+		all:        make(map[common.Hash]*types.Transaction),
+		slotByType: make(map[types.TxPoolType]int, 0),
 	}
 }
 
@@ -1670,12 +1703,22 @@ func (t *txLookup) Slots() int {
 	return t.slots
 }
 
+func (t *txLookup) SlotsByType(poolType types.TxPoolType) int {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+
+	return t.slotByType[poolType]
+}
+
 // Add adds a transaction to the lookup.
 func (t *txLookup) Add(tx *types.Transaction) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	t.slots += numSlots(tx)
+	numSlots := numSlots(tx)
+	t.slotByType[tx.PoolType] += numSlots
+
+	t.slots += numSlots
 	slotsGauge.Update(int64(t.slots))
 
 	t.all[tx.Hash()] = tx
@@ -1686,7 +1729,10 @@ func (t *txLookup) Remove(hash common.Hash) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	t.slots -= numSlots(t.all[hash])
+	numSlots := numSlots(t.all[hash])
+	t.slotByType[t.all[hash].PoolType] -= numSlots
+
+	t.slots -= numSlots
 	slotsGauge.Update(int64(t.slots))
 
 	delete(t.all, hash)

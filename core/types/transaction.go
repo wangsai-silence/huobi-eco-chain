@@ -36,9 +36,12 @@ var (
 	ErrInvalidSig = errors.New("invalid transaction v, r, s values")
 )
 
+type TxPoolType int
+
 type Transaction struct {
-	data txdata    // Consensus contents of a transaction
-	time time.Time // Time first seen locally (spam avoidance)
+	data     txdata     // Consensus contents of a transaction
+	time     time.Time  // Time first seen locally (spam avoidance)
+	PoolType TxPoolType //
 
 	// caches
 	hash atomic.Value
@@ -343,12 +346,52 @@ func (s *TxByPriceAndTime) Pop() interface{} {
 	return x
 }
 
+type TxByTypeFirst struct {
+	txs      Transactions
+	poolType TxPoolType
+}
+
+func (t *TxByTypeFirst) Len() int { return len(t.txs) }
+
+func (t *TxByTypeFirst) Swap(i, j int) { t.txs[i], t.txs[j] = t.txs[j], t.txs[i] }
+
+func (t *TxByTypeFirst) Push(x interface{}) {
+	t.txs = append(t.txs, x.(*Transaction))
+}
+
+func (t *TxByTypeFirst) Pop() interface{} {
+	old := t.txs
+	n := len(old)
+	x := old[n-1]
+	t.txs = old[0 : n-1]
+	return x
+}
+
+func (t *TxByTypeFirst) Less(i, j int) bool {
+
+	if t.txs[i].PoolType != t.txs[j].PoolType {
+		if t.poolType == t.txs[i].PoolType {
+			return true
+		}
+
+		if t.poolType == t.txs[j].PoolType {
+			return false
+		}
+	}
+
+	cmp := t.txs[i].data.Price.Cmp(t.txs[j].data.Price)
+	if cmp == 0 {
+		return t.txs[i].time.Before(t.txs[j].time)
+	}
+	return cmp > 0
+}
+
 // TransactionsByPriceAndNonce represents a set of transactions that can return
 // transactions in a profit-maximizing sorted order, while supporting removing
 // entire batches of transactions for non-executable accounts.
 type TransactionsByPriceAndNonce struct {
 	txs    map[common.Address]Transactions // Per account nonce-sorted list of transactions
-	heads  TxByPriceAndTime                // Next transaction for each unique account (price heap)
+	heads  TxByTypeFirst                   // Next transaction for each unique account (price heap)
 	signer Signer                          // Signer for the set of transactions
 }
 
@@ -359,9 +402,11 @@ type TransactionsByPriceAndNonce struct {
 // if after providing it to the constructor.
 func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions) *TransactionsByPriceAndNonce {
 	// Initialize a price and received time based heap with the head transactions
-	heads := make(TxByPriceAndTime, 0, len(txs))
+	heads := TxByTypeFirst{
+		txs: make(Transactions, 0, len(txs)),
+	}
 	for from, accTxs := range txs {
-		heads = append(heads, accTxs[0])
+		heads.txs = append(heads.txs, accTxs[0])
 		// Ensure the sender address is from the signer
 		acc, _ := Sender(signer, accTxs[0])
 		txs[acc] = accTxs[1:]
@@ -369,6 +414,7 @@ func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transa
 			delete(txs, from)
 		}
 	}
+
 	heap.Init(&heads)
 
 	// Assemble and return the transaction set
@@ -379,19 +425,25 @@ func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transa
 	}
 }
 
+func (t *TransactionsByPriceAndNonce) Regenerate(poolType TxPoolType) {
+	t.heads.poolType = poolType
+
+	heap.Init(&t.heads)
+}
+
 // Peek returns the next transaction by price.
 func (t *TransactionsByPriceAndNonce) Peek() *Transaction {
-	if len(t.heads) == 0 {
+	if len(t.heads.txs) == 0 {
 		return nil
 	}
-	return t.heads[0]
+	return t.heads.txs[0]
 }
 
 // Shift replaces the current best head with the next one from the same account.
 func (t *TransactionsByPriceAndNonce) Shift() {
-	acc, _ := Sender(t.signer, t.heads[0])
+	acc, _ := Sender(t.signer, t.heads.txs[0])
 	if txs, ok := t.txs[acc]; ok && len(txs) > 0 {
-		t.heads[0], t.txs[acc] = txs[0], txs[1:]
+		t.heads.txs[0], t.txs[acc] = txs[0], txs[1:]
 		heap.Fix(&t.heads, 0)
 	} else {
 		heap.Pop(&t.heads)

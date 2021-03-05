@@ -743,83 +743,151 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 		w.current.gasPool = new(core.GasPool).AddGas(w.current.header.GasLimit)
 	}
 
+	gasLimitByType := make(map[types.TxPoolType]*struct {
+		pool    *core.GasPool
+		percent uint
+	})
+
+	var totalPercent uint = 0
+	poolTypeInfo := w.eth.TxPool().GetPoolTypeInfo()
+	poolTypeInfo.Lock.RLock()
+	for t, percent := range poolTypeInfo.Items {
+		gasLimitByType[t] = &struct {
+			pool    *core.GasPool
+			percent uint
+		}{
+			pool:    nil,
+			percent: percent,
+		}
+
+		totalPercent = totalPercent + percent
+	}
+	poolTypeInfo.Lock.RUnlock()
+
 	var coalescedLogs []*types.Log
 
 	for {
-		// In the following three cases, we will interrupt the execution of the transaction.
-		// (1) new head block event arrival, the interrupt signal is 1
-		// (2) worker start or restart, the interrupt signal is 1
-		// (3) worker recreate the mining block with any newly arrived transactions, the interrupt signal is 2.
-		// For the first two cases, the semi-finished work will be discarded.
-		// For the third case, the semi-finished work will be submitted to the consensus engine.
-		if interrupt != nil && atomic.LoadInt32(interrupt) != commitInterruptNone {
-			// Notify resubmit loop to increase resubmitting interval due to too frequent commits.
-			if atomic.LoadInt32(interrupt) == commitInterruptResubmit {
-				ratio := float64(w.current.header.GasLimit-w.current.gasPool.Gas()) / float64(w.current.header.GasLimit)
-				if ratio < 0.1 {
-					ratio = 0.1
+		//no more tx or no more space
+		if len(gasLimitByType) == 0 || w.current.gasPool.Gas() < params.TxGas {
+			log.Trace("No space for more transaction or no more txs", "left types", len(gasLimitByType), "gas left", w.current.gasPool.Gas())
+			break
+		}
+
+		//recalc limit for type
+		for t, limit := range gasLimitByType {
+			limit.pool = new(core.GasPool).AddGas(w.current.gasPool.Gas() * uint64(limit.percent) / uint64(totalPercent))
+			log.Info("Recalculate gas limit by type", "type", t, "gas", limit.pool, "percent", limit.percent)
+		}
+
+		for t, limit := range gasLimitByType {
+			//no space for type before add tx
+			if limit.pool.Gas() < params.TxGas {
+				delete(gasLimitByType, t)
+				totalPercent = totalPercent - limit.percent
+				log.Trace("No space for more transaction", "type", t, "gas left", limit.pool.Gas())
+				continue
+			}
+
+			//sort all tx headers by type
+			txs.Regenerate(t)
+
+			for {
+				// In the following three cases, we will interrupt the execution of the transaction.
+				// (1) new head block event arrival, the interrupt signal is 1
+				// (2) worker start or restart, the interrupt signal is 1
+				// (3) worker recreate the mining block with any newly arrived transactions, the interrupt signal is 2.
+				// For the first two cases, the semi-finished work will be discarded.
+				// For the third case, the semi-finished work will be submitted to the consensus engine.
+				if interrupt != nil && atomic.LoadInt32(interrupt) != commitInterruptNone {
+					// Notify resubmit loop to increase resubmitting interval due to too frequent commits.
+					if atomic.LoadInt32(interrupt) == commitInterruptResubmit {
+						ratio := float64(w.current.header.GasLimit-w.current.gasPool.Gas()) / float64(w.current.header.GasLimit)
+						if ratio < 0.1 {
+							ratio = 0.1
+						}
+						w.resubmitAdjustCh <- &intervalAdjust{
+							ratio: ratio,
+							inc:   true,
+						}
+					}
+					return atomic.LoadInt32(interrupt) == commitInterruptNewHead
 				}
-				w.resubmitAdjustCh <- &intervalAdjust{
-					ratio: ratio,
-					inc:   true,
+				// If we don't have enough gas for any further transactions then we're done
+				if w.current.gasPool.Gas() < params.TxGas {
+					log.Trace("Not enough gas for further transactions", "have", w.current.gasPool, "want", params.TxGas)
+					break
+				}
+
+				if limit.pool.Gas() < params.TxGas {
+					log.Trace("Not enough gas for further transactions", "have", limit.pool, "want", params.TxGas, "tx type", t)
+					break
+				}
+
+				// Retrieve the next transaction and abort if all done
+				tx := txs.Peek()
+				if tx == nil || tx.PoolType != t {
+					if tx != nil {
+						log.Trace("Not same pool type", "tx type", tx.PoolType, "expected", t)
+					}
+					break
+				}
+				// Error may be ignored here. The error has already been checked
+				// during transaction acceptance is the transaction pool.
+				//
+				// We use the eip155 signer regardless of the current hf.
+				from, _ := types.Sender(w.current.signer, tx)
+				// Check whether the tx is replay protected. If we're not in the EIP155 hf
+				// phase, start ignoring the sender until we do.
+				if tx.Protected() && !w.chainConfig.IsEIP155(w.current.header.Number) {
+					log.Trace("Ignoring reply protected transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
+
+					txs.Pop()
+					continue
+				}
+				// Start executing the transaction
+				w.current.state.Prepare(tx.Hash(), common.Hash{}, w.current.tcount)
+
+				logs, err := w.commitTransaction(tx, coinbase)
+				if err == nil {
+					err = limit.pool.SubGas(tx.Gas())
+				}
+				switch err {
+				case core.ErrGasLimitReached:
+					// Pop the current out-of-gas transaction without shifting in the next from the account
+					log.Trace("Gas limit exceeded for current block", "sender", from)
+					txs.Pop()
+
+				case core.ErrNonceTooLow:
+					// New head notification data race between the transaction pool and miner, shift
+					log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+					txs.Shift()
+
+				case core.ErrNonceTooHigh:
+					// Reorg notification data race between the transaction pool and miner, skip account =
+					log.Trace("Skipping account with hight nonce", "sender", from, "nonce", tx.Nonce())
+					txs.Pop()
+
+				case nil:
+					// Everything ok, collect the logs and shift in the next transaction from the same account
+					coalescedLogs = append(coalescedLogs, logs...)
+					w.current.tcount++
+					txs.Shift()
+
+				default:
+					// Strange error, discard the transaction and get the next in line (note, the
+					// nonce-too-high clause will prevent us from executing in vain).
+					log.Debug("Transaction failed, account skipped", "hash", tx.Hash(), "err", err)
+					txs.Shift()
+
 				}
 			}
-			return atomic.LoadInt32(interrupt) == commitInterruptNewHead
-		}
-		// If we don't have enough gas for any further transactions then we're done
-		if w.current.gasPool.Gas() < params.TxGas {
-			log.Trace("Not enough gas for further transactions", "have", w.current.gasPool, "want", params.TxGas)
-			break
-		}
-		// Retrieve the next transaction and abort if all done
-		tx := txs.Peek()
-		if tx == nil {
-			break
-		}
-		// Error may be ignored here. The error has already been checked
-		// during transaction acceptance is the transaction pool.
-		//
-		// We use the eip155 signer regardless of the current hf.
-		from, _ := types.Sender(w.current.signer, tx)
-		// Check whether the tx is replay protected. If we're not in the EIP155 hf
-		// phase, start ignoring the sender until we do.
-		if tx.Protected() && !w.chainConfig.IsEIP155(w.current.header.Number) {
-			log.Trace("Ignoring reply protected transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
 
-			txs.Pop()
-			continue
-		}
-		// Start executing the transaction
-		w.current.state.Prepare(tx.Hash(), common.Hash{}, w.current.tcount)
-
-		logs, err := w.commitTransaction(tx, coinbase)
-		switch err {
-		case core.ErrGasLimitReached:
-			// Pop the current out-of-gas transaction without shifting in the next from the account
-			log.Trace("Gas limit exceeded for current block", "sender", from)
-			txs.Pop()
-
-		case core.ErrNonceTooLow:
-			// New head notification data race between the transaction pool and miner, shift
-			log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
-			txs.Shift()
-
-		case core.ErrNonceTooHigh:
-			// Reorg notification data race between the transaction pool and miner, skip account =
-			log.Trace("Skipping account with hight nonce", "sender", from, "nonce", tx.Nonce())
-			txs.Pop()
-
-		case nil:
-			// Everything ok, collect the logs and shift in the next transaction from the same account
-			coalescedLogs = append(coalescedLogs, logs...)
-			w.current.tcount++
-			txs.Shift()
-
-		default:
-			// Strange error, discard the transaction and get the next in line (note, the
-			// nonce-too-high clause will prevent us from executing in vain).
-			log.Debug("Transaction failed, account skipped", "hash", tx.Hash(), "err", err)
-			txs.Shift()
+			//no more tx of this type
+			if limit.pool.Gas() >= params.TxGas {
+				delete(gasLimitByType, t)
+				totalPercent = totalPercent - limit.percent
+				log.Trace("Remove finished tx pool type", "type", t, "totalPercent", totalPercent, "left gas", limit.pool.Gas())
+			}
 		}
 	}
 
