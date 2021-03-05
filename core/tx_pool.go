@@ -357,6 +357,7 @@ func (pool *TxPool) loopBlacklist() {
 		select {
 		// Update black list
 		case <-blackList.C:
+			blackList.Stop()
 			blackList = time.NewTicker(pool.config.UpdateBlacklistInterval)
 
 			if pool.config.BlacklistURL == "" {
