@@ -715,13 +715,13 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	}
 
 	pool.poolTypeListLock.RLock()
-	percent, ok := pool.poolTypeList.TypeInfo[tx.PoolType]
+	percent, ok := pool.poolTypeList.TypeInfo[tx.PoolType()]
 	pool.poolTypeListLock.RUnlock()
 	if ok {
 		slotForPoolType := int(pool.config.GlobalSlots+pool.config.GlobalQueue) * int(percent) / 100
-		log.Trace("Slot for pool type", "type", tx.PoolType, "allowed max slot", slotForPoolType, "current", pool.all.SlotsByType(tx.PoolType))
+		log.Trace("Slot for pool type", "type", tx.PoolType(), "allowed max slot", slotForPoolType, "current", pool.all.SlotsByType(tx.PoolType()))
 
-		if pool.all.SlotsByType(tx.PoolType) >= slotForPoolType {
+		if pool.all.SlotsByType(tx.PoolType()) >= slotForPoolType {
 			// If the new transaction is underpriced, don't accept it
 			if !local && pool.priced.Underpriced(tx, pool.locals) {
 				log.Info("Discarding underpriced transaction", "hash", hash, "price", tx.GasPrice())
@@ -729,7 +729,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 				return false, ErrUnderpriced
 			}
 			// New transaction is better than our worse ones, make room for it
-			drop := pool.priced.Discard(tx.PoolType, pool.all.SlotsByType(tx.PoolType)-slotForPoolType+numSlots(tx), pool.locals)
+			drop := pool.priced.Discard(tx.PoolType(), pool.all.SlotsByType(tx.PoolType())-slotForPoolType+numSlots(tx), pool.locals)
 			for _, tx := range drop {
 				log.Info("Discarding freshly underpriced transaction", "hash", tx.Hash(), "price", tx.GasPrice())
 				underpricedTxMeter.Mark(1)
@@ -976,12 +976,12 @@ func (pool *TxPool) setPoolType(tx *types.Transaction, from common.Address) {
 	defer pool.poolTypeListLock.RUnlock()
 	if to := tx.To(); to != nil {
 		if t, exist := pool.poolTypeList.Tos[*to]; exist {
-			tx.PoolType = t
+			tx.SetPoolType(t)
 			return
 		}
 	}
 	// if not exist, it will be the default value 0
-	tx.PoolType = pool.poolTypeList.Froms[from]
+	tx.SetPoolType(pool.poolTypeList.Froms[from])
 }
 
 // addTxsLocked attempts to queue a batch of transactions if they are valid.
@@ -1749,7 +1749,7 @@ func (t *txLookup) Add(tx *types.Transaction) {
 	defer t.lock.Unlock()
 
 	numSlots := numSlots(tx)
-	t.slotByType[tx.PoolType] += numSlots
+	t.slotByType[tx.PoolType()] += numSlots
 
 	t.slots += numSlots
 	slotsGauge.Update(int64(t.slots))
@@ -1763,7 +1763,7 @@ func (t *txLookup) Remove(hash common.Hash) {
 	defer t.lock.Unlock()
 
 	numSlots := numSlots(t.all[hash])
-	t.slotByType[t.all[hash].PoolType] -= numSlots
+	t.slotByType[t.all[hash].PoolType()] -= numSlots
 
 	t.slots -= numSlots
 	slotsGauge.Update(int64(t.slots))

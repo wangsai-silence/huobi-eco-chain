@@ -41,7 +41,7 @@ type TxPoolType int
 type Transaction struct {
 	data     txdata     // Consensus contents of a transaction
 	time     time.Time  // Time first seen locally (spam avoidance)
-	PoolType TxPoolType //
+	poolType TxPoolType //
 
 	// caches
 	hash atomic.Value
@@ -190,9 +190,11 @@ func (tx *Transaction) GasPriceCmp(other *Transaction) int {
 func (tx *Transaction) GasPriceIntCmp(other *big.Int) int {
 	return tx.data.Price.Cmp(other)
 }
-func (tx *Transaction) Value() *big.Int  { return new(big.Int).Set(tx.data.Amount) }
-func (tx *Transaction) Nonce() uint64    { return tx.data.AccountNonce }
-func (tx *Transaction) CheckNonce() bool { return true }
+func (tx *Transaction) Value() *big.Int          { return new(big.Int).Set(tx.data.Amount) }
+func (tx *Transaction) Nonce() uint64            { return tx.data.AccountNonce }
+func (tx *Transaction) CheckNonce() bool         { return true }
+func (tx *Transaction) PoolType() TxPoolType     { return tx.poolType }
+func (tx *Transaction) SetPoolType(t TxPoolType) { tx.poolType = t }
 
 // To returns the recipient address of the transaction.
 // It returns nil if the transaction is a contract creation.
@@ -369,12 +371,12 @@ func (t *TxByTypeFirst) Pop() interface{} {
 
 func (t *TxByTypeFirst) Less(i, j int) bool {
 
-	if t.txs[i].PoolType != t.txs[j].PoolType {
-		if t.poolType == t.txs[i].PoolType {
+	if t.txs[i].poolType != t.txs[j].poolType {
+		if t.poolType == t.txs[i].poolType {
 			return true
 		}
 
-		if t.poolType == t.txs[j].PoolType {
+		if t.poolType == t.txs[j].poolType {
 			return false
 		}
 	}

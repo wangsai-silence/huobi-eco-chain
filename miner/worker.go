@@ -822,9 +822,9 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 
 				// Retrieve the next transaction and abort if all done
 				tx := txs.Peek()
-				if tx == nil || tx.PoolType != t {
+				if tx == nil || tx.PoolType() != t {
 					if tx != nil {
-						log.Trace("Not same pool type", "tx type", tx.PoolType, "expected", t)
+						log.Trace("Not same pool type", "tx type", tx.PoolType(), "expected", t)
 					}
 					break
 				}

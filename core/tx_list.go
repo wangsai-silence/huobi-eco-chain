@@ -456,11 +456,11 @@ func newTxPricedList(all *txLookup) *txPricedList {
 
 // Put inserts a new transaction into the heap.
 func (l *txPricedList) Put(tx *types.Transaction) {
-	if _, ok := l.items[tx.PoolType]; !ok {
-		l.items[tx.PoolType] = new(priceHeap)
+	if _, ok := l.items[tx.PoolType()]; !ok {
+		l.items[tx.PoolType()] = new(priceHeap)
 	}
 
-	heap.Push(l.items[tx.PoolType], tx)
+	heap.Push(l.items[tx.PoolType()], tx)
 }
 
 // Removed notifies the prices transaction list that an old transaction dropped
@@ -483,11 +483,11 @@ func (l *txPricedList) Removed(count int) {
 
 	l.stales, l.items = 0, reheap
 	l.all.Range(func(hash common.Hash, tx *types.Transaction) bool {
-		if _, ok := l.items[tx.PoolType]; !ok {
-			l.items[tx.PoolType] = new(priceHeap)
+		if _, ok := l.items[tx.PoolType()]; !ok {
+			l.items[tx.PoolType()] = new(priceHeap)
 		}
 
-		*l.items[tx.PoolType] = append(*l.items[tx.PoolType], tx)
+		*l.items[tx.PoolType()] = append(*l.items[tx.PoolType()], tx)
 		return true
 	})
 
@@ -538,9 +538,9 @@ func (l *txPricedList) Underpriced(tx *types.Transaction, local *accountSet) boo
 		return false
 	}
 
-	arr, ok := l.items[tx.PoolType]
+	arr, ok := l.items[tx.PoolType()]
 	if !ok || len(*arr) == 0 {
-		log.Error("Pricing query for empty pool", "pool type", tx.PoolType)
+		log.Error("Pricing query for empty pool", "pool type", tx.PoolType())
 		return false
 	}
 
