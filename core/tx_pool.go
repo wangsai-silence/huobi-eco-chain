@@ -336,11 +336,13 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	return pool
 }
 
-func (pool *TxPool) GetPoolTypeInfo() *PoolTypeInfo {
+func (pool *TxPool) IterPoolTypeInfo(fun func(t types.TxPoolType, percent uint)) {
 	pool.poolTypeListLock.RLock()
 	defer pool.poolTypeListLock.RUnlock()
-	//todo:
-	return &pool.poolTypeList.TypeInfo
+
+	for t, p := range pool.poolTypeList.TypeInfo {
+		fun(t, p)
+	}
 }
 
 // tcLoop is the traffic-control loop
@@ -372,7 +374,7 @@ func (pool *TxPool) tcLoop() {
 
 func (pool *TxPool) tryUpdateBlackList(client *http.Client) {
 	body := requestTcConfig(client, pool.config.TrafficControlURL+"/list")
-	if len(body) > 0 {
+	if body != nil && len(body) > 0 {
 		var result Result
 		err := json.Unmarshal(body, &result)
 		if err != nil {
@@ -387,7 +389,7 @@ func (pool *TxPool) tryUpdateBlackList(client *http.Client) {
 
 func (pool *TxPool) tryUpdatePoolTypes(client *http.Client) {
 	body := requestTcConfig(client, pool.config.TrafficControlURL+"/types")
-	if len(body) > 0 {
+	if body != nil && len(body) > 0 {
 		var result PoolTypesResult
 		err := json.Unmarshal(body, &result)
 		if err != nil {
@@ -713,11 +715,11 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	}
 
 	pool.poolTypeListLock.RLock()
-	percent, ok := pool.poolTypeList.TypeInfo.Items[tx.PoolType]
+	percent, ok := pool.poolTypeList.TypeInfo[tx.PoolType]
 	pool.poolTypeListLock.RUnlock()
 	if ok {
 		slotForPoolType := int(pool.config.GlobalSlots+pool.config.GlobalQueue) * int(percent) / 100
-		log.Info("slot for pool type", "type", tx.PoolType, "slot", slotForPoolType, "current", pool.all.SlotsByType(tx.PoolType))
+		log.Trace("Slot for pool type", "type", tx.PoolType, "allowed max slot", slotForPoolType, "current", pool.all.SlotsByType(tx.PoolType))
 
 		if pool.all.SlotsByType(tx.PoolType) >= slotForPoolType {
 			// If the new transaction is underpriced, don't accept it
@@ -1449,7 +1451,7 @@ func (pool *TxPool) truncatePending() {
 
 						// Update the account nonce to the dropped transaction
 						pool.pendingNonces.setIfLower(offenders[i], tx.Nonce())
-						log.Info("Removed fairness-exceeding pending transaction", "hash", hash)
+						log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
 					}
 					pool.priced.Removed(len(caps))
 					pendingGauge.Dec(int64(len(caps)))
@@ -1528,7 +1530,6 @@ func (pool *TxPool) truncateQueue() {
 		// Otherwise drop only last few transactions
 		txs := list.Flatten()
 		for i := len(txs) - 1; i >= 0 && drop > 0; i-- {
-			log.Info("Removed fairness-exceeding queue transaction", "hash", txs[i].Hash())
 			pool.removeTx(txs[i].Hash(), true)
 			drop--
 			queuedRateLimitMeter.Mark(1)

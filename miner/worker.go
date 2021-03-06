@@ -749,9 +749,7 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 	})
 
 	var totalPercent uint = 0
-	poolTypeInfo := w.eth.TxPool().GetPoolTypeInfo()
-	//todo:
-	for t, percent := range poolTypeInfo.Items {
+	w.eth.TxPool().IterPoolTypeInfo(func(t types.TxPoolType, percent uint) {
 		gasLimitByType[t] = &struct {
 			pool    *core.GasPool
 			percent uint
@@ -761,7 +759,7 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 		}
 
 		totalPercent = totalPercent + percent
-	}
+	})
 
 	var coalescedLogs []*types.Log
 

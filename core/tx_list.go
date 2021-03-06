@@ -556,7 +556,7 @@ func (l *txPricedList) Underpriced(tx *types.Transaction, local *accountSet) boo
 	}
 
 	cheapest := []*types.Transaction(*arr)[0]
-	log.Info("underprice compare", "cheapest", cheapest.GasPrice().String(), "input", tx.GasPrice().String())
+	log.Trace("Underprice compare", "cheapest", cheapest.GasPrice().String(), "input", tx.GasPrice().String())
 	return cheapest.GasPriceCmp(tx) >= 0
 }
 

@@ -17,20 +17,15 @@ type PoolTypesResult struct {
 
 // PoolTypeList is the config used to seprates transactions to different types
 type PoolTypeList struct {
-	TypeInfo PoolTypeInfo                        `json:"typeInfo"`
+	TypeInfo map[types.TxPoolType]uint           `json:"typeInfo"`
 	Froms    map[common.Address]types.TxPoolType `json:"froms"`
 	Tos      map[common.Address]types.TxPoolType `json:"tos"`
-}
-
-// PoolTypeInfo contains the percentile for each pool type
-type PoolTypeInfo struct {
-	Items map[types.TxPoolType]uint
 }
 
 // NewPoolTypeList returns a default PoolTypeList instance
 func newPoolTypeList() *PoolTypeList {
 	return &PoolTypeList{
-		TypeInfo: PoolTypeInfo{Items: map[types.TxPoolType]uint{normal: 100}},
+		TypeInfo: map[types.TxPoolType]uint{normal: 100},
 		Froms:    make(map[common.Address]types.TxPoolType),
 		Tos:      make(map[common.Address]types.TxPoolType),
 	}
