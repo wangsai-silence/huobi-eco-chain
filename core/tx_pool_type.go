@@ -1,6 +1,9 @@
 package core
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -29,4 +32,23 @@ func newPoolTypeList() *PoolTypeList {
 		Froms:    make(map[common.Address]types.TxPoolType),
 		Tos:      make(map[common.Address]types.TxPoolType),
 	}
+}
+
+func (p *PoolTypeList) check() (err error) {
+	if p.TypeInfo == nil {
+		return errors.New("Pool type info is nil")
+	}
+
+	total := 0
+	for t, v := range p.TypeInfo {
+		if v > 100 {
+			return fmt.Errorf("type:%v percent is %v, greater than 100", t, v)
+		}
+		total += int(v)
+	}
+	if total > 100 {
+		return errors.New("total percent is greater than 100")
+	}
+
+	return
 }

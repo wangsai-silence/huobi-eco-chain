@@ -389,19 +389,28 @@ func (pool *TxPool) tryUpdateBlackList(client *http.Client) {
 
 func (pool *TxPool) tryUpdatePoolTypes(client *http.Client) {
 	body := requestTcConfig(client, pool.config.TrafficControlURL+"/types")
-	if body != nil && len(body) > 0 {
-		var result PoolTypesResult
-		err := json.Unmarshal(body, &result)
-		if err != nil {
-			log.Warn("unmarshal PoolTypesResult failed", "err", err)
-			return
-		}
-		if result.Code == 0 {
-			pool.poolTypeListLock.Lock()
-			pool.poolTypeList = result.List
-			pool.poolTypeListLock.Unlock()
-		}
+	if body == nil || len(body) == 0 {
+		return
 	}
+	var result PoolTypesResult
+	err := json.Unmarshal(body, &result)
+	if err != nil {
+		log.Warn("unmarshal PoolTypesResult failed", "err", err)
+		return
+	}
+
+	if result.Code != 0 || result.List == nil {
+		return
+	}
+
+	if err = result.List.check(); err != nil {
+		log.Warn("Pool type info self check failed", "err", err)
+		return
+	}
+
+	pool.poolTypeListLock.Lock()
+	pool.poolTypeList = result.List
+	pool.poolTypeListLock.Unlock()
 }
 
 func requestTcConfig(client *http.Client, url string) (body []byte) {

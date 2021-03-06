@@ -773,7 +773,7 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 		//recalc limit for type
 		for t, limit := range gasLimitByType {
 			limit.pool = new(core.GasPool).AddGas(w.current.gasPool.Gas() * uint64(limit.percent) / uint64(totalPercent))
-			log.Info("Recalculate gas limit by type", "type", t, "gas", limit.pool, "percent", limit.percent)
+			log.Trace("Recalculate gas limit by type", "type", t, "gas", limit.pool, "percent", limit.percent)
 		}
 
 		for t, limit := range gasLimitByType {
