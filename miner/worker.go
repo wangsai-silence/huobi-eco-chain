@@ -750,7 +750,7 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 
 	var totalPercent uint = 0
 	poolTypeInfo := w.eth.TxPool().GetPoolTypeInfo()
-	poolTypeInfo.Lock.RLock()
+	//todo:
 	for t, percent := range poolTypeInfo.Items {
 		gasLimitByType[t] = &struct {
 			pool    *core.GasPool
@@ -762,7 +762,6 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 
 		totalPercent = totalPercent + percent
 	}
-	poolTypeInfo.Lock.RUnlock()
 
 	var coalescedLogs []*types.Log
 

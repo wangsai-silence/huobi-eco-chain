@@ -156,8 +156,8 @@ type TxPoolConfig struct {
 
 	Lifetime time.Duration // Maximum amount of time non-executable transaction are queued
 
-	BlacklistURL            string
-	UpdateBlacklistInterval time.Duration
+	TrafficControlURL      string
+	UpdateTcConfigInterval time.Duration
 }
 
 // DefaultTxPoolConfig contains the default configurations for the transaction
@@ -176,8 +176,8 @@ var DefaultTxPoolConfig = TxPoolConfig{
 
 	Lifetime: 3 * time.Hour,
 
-	BlacklistURL:            "",
-	UpdateBlacklistInterval: 10 * time.Minute,
+	TrafficControlURL:      "",
+	UpdateTcConfigInterval: 10 * time.Minute,
 }
 
 // sanitize checks the provided user configurations and changes anything that's
@@ -217,9 +217,9 @@ func (config *TxPoolConfig) sanitize() TxPoolConfig {
 		conf.Lifetime = DefaultTxPoolConfig.Lifetime
 	}
 
-	if conf.UpdateBlacklistInterval < time.Second*1 {
-		log.Warn("Sanitizing invalid txpool blacklist update interval", "provided", conf.UpdateBlacklistInterval, "updated", DefaultTxPoolConfig.UpdateBlacklistInterval)
-		conf.UpdateBlacklistInterval = DefaultTxPoolConfig.UpdateBlacklistInterval
+	if conf.UpdateTcConfigInterval < time.Second*1 {
+		log.Warn("Sanitizing invalid txpool blacklist update interval", "provided", conf.UpdateTcConfigInterval, "updated", DefaultTxPoolConfig.UpdateTcConfigInterval)
+		conf.UpdateTcConfigInterval = DefaultTxPoolConfig.UpdateTcConfigInterval
 	}
 
 	return conf
@@ -257,8 +257,9 @@ type TxPool struct {
 	all     *txLookup                    // All transactions to allow lookups
 	priced  *txPricedList                // All transactions sorted by price
 
-	blackList    *blackList    //validate tx by black list
-	poolTypeInfo *PoolTypeInfo //pool seperate into serval parts to load different kinds of txs
+	blackList        *blackList    //validate tx by black list
+	poolTypeList     *PoolTypeList // pool seperate into serval parts to load different kinds of txs
+	poolTypeListLock sync.RWMutex
 
 	chainHeadCh     chan ChainHeadEvent
 	chainHeadSub    event.Subscription
@@ -298,12 +299,8 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		reorgShutdownCh: make(chan struct{}),
 		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
 		blackList:       newBlackList(),
-		poolTypeInfo:    newPoolTypeInfo(),
+		poolTypeList:    newPoolTypeList(),
 	}
-
-	//for test use
-	pool.poolTypeInfo.Items[0] = 70
-	pool.poolTypeInfo.Items[1] = 30
 
 	pool.locals = newAccountSet(pool.signer)
 	for _, addr := range config.Locals {
@@ -334,73 +331,99 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	pool.wg.Add(1)
 	go pool.loop()
 
-	go pool.loopBlacklist()
+	go pool.tcLoop()
 
 	return pool
 }
 
 func (pool *TxPool) GetPoolTypeInfo() *PoolTypeInfo {
-	return pool.poolTypeInfo
+	pool.poolTypeListLock.RLock()
+	defer pool.poolTypeListLock.RUnlock()
+	//todo:
+	return &pool.poolTypeList.TypeInfo
 }
 
-func (pool *TxPool) loopBlacklist() {
+// tcLoop is the traffic-control loop
+func (pool *TxPool) tcLoop() {
+	if pool.config.TrafficControlURL == "" {
+		log.Warn("traffic-control url not configed")
+		return
+	}
 
 	var (
-		blackList = time.NewTicker(1)
-		client    = &http.Client{
-			Timeout: pool.config.UpdateBlacklistInterval / 10,
+		tcTick = time.NewTicker(pool.config.UpdateTcConfigInterval)
+		client = &http.Client{
+			Timeout: pool.config.UpdateTcConfigInterval / 10,
 		}
 	)
-	defer blackList.Stop()
+	defer tcTick.Stop()
+	pool.tryUpdatePoolTypes(client)
+	pool.tryUpdateBlackList(client)
 
 	for {
 		select {
 		// Update black list
-		case <-blackList.C:
-			blackList.Stop()
-			blackList = time.NewTicker(pool.config.UpdateBlacklistInterval)
-
-			if pool.config.BlacklistURL == "" {
-				log.Warn("Blacklist url not configed")
-				continue
-			}
-
-			resp, err := client.Get(pool.config.BlacklistURL)
-			if err != nil {
-				log.Warn("Failed to request blacklist", "err", err)
-				continue
-			}
-			if resp == nil {
-				log.Warn("Failed to request blacklist, response is null")
-				continue
-			}
-			if resp.StatusCode != 200 {
-				log.Warn("Failed to request blacklist", "status code", resp.StatusCode)
-				continue
-			}
-
-			defer resp.Body.Close()
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				log.Warn("Failed to request blacklist", "err", err)
-				continue
-			}
-
-			newList := Result{}
-
-			err = json.Unmarshal(body, &newList)
-			if err != nil {
-				log.Warn("Failed to request blacklist", "err", err)
-				continue
-			}
-
-			if newList.Code != 0 {
-				log.Warn("Failed to request blacklist", "response code", newList.Code)
-				continue
-			}
-			pool.blackList.update(newList.List)
+		case <-tcTick.C:
+			pool.tryUpdatePoolTypes(client)
+			pool.tryUpdateBlackList(client)
 		}
 	}
+}
+
+func (pool *TxPool) tryUpdateBlackList(client *http.Client) {
+	body := requestTcConfig(client, pool.config.TrafficControlURL+"/list")
+	if len(body) > 0 {
+		var result Result
+		err := json.Unmarshal(body, &result)
+		if err != nil {
+			log.Warn("unmarshal black result failed", "err", err)
+			return
+		}
+		if result.Code == 0 {
+			pool.blackList.update(result.List)
+		}
+	}
+}
+
+func (pool *TxPool) tryUpdatePoolTypes(client *http.Client) {
+	body := requestTcConfig(client, pool.config.TrafficControlURL+"/types")
+	if len(body) > 0 {
+		var result PoolTypesResult
+		err := json.Unmarshal(body, &result)
+		if err != nil {
+			log.Warn("unmarshal PoolTypesResult failed", "err", err)
+			return
+		}
+		if result.Code == 0 {
+			pool.poolTypeListLock.Lock()
+			pool.poolTypeList = result.List
+			pool.poolTypeListLock.Unlock()
+		}
+	}
+}
+
+func requestTcConfig(client *http.Client, url string) (body []byte) {
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Warn("Failed to request tcconfig", "url", url, "err", err)
+		return nil
+	}
+	if resp == nil {
+		log.Warn("Failed to request tcconfig, response is null", "url", url)
+		return nil
+	}
+	if resp.StatusCode != 200 {
+		log.Warn("Failed to request blacklist", "url", url, "status code", resp.StatusCode)
+		return nil
+	}
+
+	defer resp.Body.Close()
+	body, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Warn("Failed to request blacklist", "url", url, "err", err)
+		return nil
+	}
+	return
 }
 
 // loop is the transaction pool's main event loop, waiting for and reacting to
@@ -689,9 +712,9 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		return false, err
 	}
 
-	pool.poolTypeInfo.Lock.RLock()
-	percent, ok := pool.poolTypeInfo.Items[tx.PoolType]
-	pool.poolTypeInfo.Lock.RUnlock()
+	pool.poolTypeListLock.RLock()
+	percent, ok := pool.poolTypeList.TypeInfo.Items[tx.PoolType]
+	pool.poolTypeListLock.RUnlock()
 	if ok {
 		slotForPoolType := int(pool.config.GlobalSlots+pool.config.GlobalQueue) * int(percent) / 100
 		log.Info("slot for pool type", "type", tx.PoolType, "slot", slotForPoolType, "current", pool.all.SlotsByType(tx.PoolType))
@@ -901,13 +924,6 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 	)
 
 	for i, tx := range txs {
-		//for test use
-		if tx.To().Hash().Big().Cmp(big.NewInt(0)) == 0 {
-			tx.PoolType = 1
-		} else {
-			tx.PoolType = 0
-		}
-
 		// If the transaction is known, pre-set the error slot
 		if pool.all.Get(tx.Hash()) != nil {
 			errs[i] = ErrAlreadyKnown
@@ -917,12 +933,13 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 		// Exclude transactions with invalid signatures as soon as
 		// possible and cache senders in transactions before
 		// obtaining lock
-		_, err := types.Sender(pool.signer, tx)
+		from, err := types.Sender(pool.signer, tx)
 		if err != nil {
 			errs[i] = ErrInvalidSender
 			invalidTxMeter.Mark(1)
 			continue
 		}
+		pool.setPoolType(tx, from)
 		// Accumulate all unknown transactions for deeper processing
 		news = append(news, tx)
 	}
@@ -949,6 +966,20 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 		<-done
 	}
 	return errs
+}
+
+// setPoolType sets the pool type to the transaction
+func (pool *TxPool) setPoolType(tx *types.Transaction, from common.Address) {
+	pool.poolTypeListLock.RLock()
+	defer pool.poolTypeListLock.RUnlock()
+	if to := tx.To(); to != nil {
+		if t, exist := pool.poolTypeList.Tos[*to]; exist {
+			tx.PoolType = t
+			return
+		}
+	}
+	// if not exist, it will be the default value 0
+	tx.PoolType = pool.poolTypeList.Froms[from]
 }
 
 // addTxsLocked attempts to queue a batch of transactions if they are valid.
